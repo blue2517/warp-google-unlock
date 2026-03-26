@@ -20,32 +20,9 @@ show_banner() {
     echo -e "${NC}"
 }
 
-# 检查 root
-[[ $EUID -ne 0 ]] && { echo -e "${RED}请使用 root 运行！${NC}"; exit 1; }
-
-# 检测系统
-if [ -f /etc/os-release ]; then
-    . /etc/os-release
-    OS=$ID
-    VERSION=$VERSION_ID
-    CODENAME=$VERSION_CODENAME
-else
-    echo -e "${RED}无法检测系统${NC}"; exit 1
-fi
-
-ARCH=$(dpkg --print-architecture 2>/dev/null || echo "amd64")
-echo -e "${GREEN}系统: $OS $VERSION ($CODENAME) $ARCH${NC}"
-
-# 显示当前 IP
-echo -e "\n${YELLOW}当前 IP 信息:${NC}"
-CURRENT_IP=$(curl -4 -s --max-time 5 ip.sb)
-IP_INFO=$(curl -s --max-time 5 "http://ip-api.com/json/$CURRENT_IP?lang=zh-CN" 2>/dev/null)
-echo -e "IP: ${GREEN}$CURRENT_IP${NC}"
-echo -e "位置: ${GREEN}$(echo $IP_INFO | grep -oP '"country":"\K[^"]+') - $(echo $IP_INFO | grep -oP '"city":"\K[^"]+')${NC}"
-
 # 安装 Cloudflare WARP 官方客户端
 install_warp() {
-    echo -e "\n${CYAN}[1/3] 安装 Cloudflare WARP 官方客户端...${NC}"
+    echo -e "\n${CYAN}[1/4] 安装 Cloudflare WARP 官方客户端...${NC}"
     
     case $OS in
         ubuntu|debian)
@@ -96,14 +73,36 @@ EOF
 
 # 配置 WARP
 configure_warp() {
-    echo -e "\n${CYAN}[2/3] 配置 WARP...${NC}"
+    echo -e "\n${CYAN}[2/4] 配置 WARP...${NC}"
+    
+    # 确保 warp-svc 服务已启动
+    echo -e "确保 warp-svc 服务运行中..."
+    systemctl enable --now warp-svc 2>/dev/null
+    sleep 3
+    if ! systemctl is-active --quiet warp-svc 2>/dev/null; then
+        echo -e "${RED}warp-svc 服务未能启动，请检查日志: journalctl -u warp-svc${NC}"
+        exit 1
+    fi
+    echo -e "${GREEN}✓ warp-svc 服务已就绪${NC}"
     
     # 注册设备
     echo -e "正在注册设备..."
-    warp-cli --accept-tos registration new 2>/dev/null || warp-cli --accept-tos register 2>/dev/null || true
+    REG_OUTPUT=$(warp-cli --accept-tos registration new 2>&1 || warp-cli --accept-tos register 2>&1)
+    REG_EXIT=$?
+    if [ $REG_EXIT -ne 0 ] && ! echo "$REG_OUTPUT" | grep -qi "already"; then
+        echo -e "${RED}WARP 注册失败: $REG_OUTPUT${NC}"
+        echo -e "${YELLOW}提示: 如果 VPS 屏蔽了出站 UDP，WARP 将无法工作。${NC}"
+        exit 1
+    fi
+    echo -e "${GREEN}✓ 设备注册完成${NC}"
     
     # 设置为代理模式 (不会接管全部流量，只通过 SOCKS5 代理)
-    warp-cli --accept-tos mode proxy 2>/dev/null || warp-cli mode proxy 2>/dev/null || true
+    echo -e "设置代理模式..."
+    MODE_OUTPUT=$(warp-cli --accept-tos mode proxy 2>&1 || warp-cli mode proxy 2>&1)
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}设置代理模式失败: $MODE_OUTPUT${NC}"
+        exit 1
+    fi
     
     # 设置代理端口
     warp-cli --accept-tos proxy port 40000 2>/dev/null || warp-cli proxy port 40000 2>/dev/null || true
@@ -112,18 +111,45 @@ configure_warp() {
     echo -e "正在连接 WARP..."
     warp-cli --accept-tos connect 2>/dev/null || warp-cli connect 2>/dev/null
     
-    sleep 3
+    # 轮询等待连接成功 (最多 30 秒)
+    CONNECTED=false
+    for i in {1..15}; do
+        STATUS=$(warp-cli --accept-tos status 2>/dev/null || warp-cli status 2>/dev/null)
+        if echo "$STATUS" | grep -qi "connected"; then
+            CONNECTED=true
+            echo -e "${GREEN}✓ WARP 已连接${NC}"
+            break
+        fi
+        echo -e "等待连接... ($i/15)"
+        sleep 2
+    done
+    
+    if [ "$CONNECTED" = false ]; then
+        echo -e "${RED}WARP 连接超时！${NC}"
+        echo -e "${YELLOW}提示: 可能原因: 1) VPS 屏蔽出站 UDP  2) 网络条件差${NC}"
+        echo -e "${YELLOW}你可以稍后使用 'warp-cli connect' 重试${NC}"
+        # 不直接 exit，允许用户继续（可能稍后连上）
+    fi
     
     # 显示状态
-    STATUS=$(warp-cli --accept-tos status 2>/dev/null || warp-cli status 2>/dev/null)
     echo -e "状态: ${GREEN}$STATUS${NC}"
-    
     echo -e "${GREEN}✓ WARP 配置完成${NC}"
 }
 
 # 配置透明代理 (让 Google 流量自动走 WARP)
 setup_transparent_proxy() {
-    echo -e "\n${CYAN}[3/3] 配置透明代理规则...${NC}"
+    echo -e "\n${CYAN}[3/4] 配置透明代理规则...${NC}"
+    
+    # 验证 SOCKS5 代理可用性
+    echo -e "验证 WARP SOCKS5 代理..."
+    SOCKS_TEST=$(curl -x socks5://127.0.0.1:40000 -s --max-time 10 ip.sb 2>/dev/null)
+    if [ -z "$SOCKS_TEST" ]; then
+        echo -e "${RED}⚠ WARP SOCKS5 代理 (127.0.0.1:40000) 不可用！${NC}"
+        echo -e "${YELLOW}透明代理配置将继续，但在 WARP 连接成功前 Google 流量可能无法访问。${NC}"
+        echo -e "${YELLOW}建议稍后使用 'warp-cli connect' 连接后再执行 'warp restart'。${NC}"
+    else
+        echo -e "${GREEN}✓ SOCKS5 代理可用，WARP IP: $SOCKS_TEST${NC}"
+    fi
     
     # 禁用 IPv6 访问 Google（避免 IPv4/IPv6 不匹配导致被检测）
     echo -e "配置 IPv6 规则..."
@@ -151,6 +177,10 @@ setup_transparent_proxy() {
             ;;
     esac
     
+    # 禁用系统自带的 redsocks 服务，避免与脚本手动管理的实例冲突
+    systemctl stop redsocks 2>/dev/null
+    systemctl disable redsocks 2>/dev/null
+    
     # 创建 redsocks 配置
     cat > /etc/redsocks.conf << 'EOF'
 base {
@@ -174,11 +204,12 @@ EOF
     cat > /usr/local/bin/warp-google << 'SCRIPT'
 #!/bin/bash
 
-# Google IP 段
+# Google IP 段 (注意: 此列表可能需要定期更新)
 GOOGLE_IPS="
 8.8.4.0/24
 8.8.8.0/24
 34.0.0.0/9
+34.128.0.0/10
 35.184.0.0/13
 35.192.0.0/12
 35.224.0.0/12
@@ -194,6 +225,7 @@ GOOGLE_IPS="
 172.217.0.0/16
 172.253.0.0/16
 173.194.0.0/16
+199.36.153.0/24
 209.85.128.0/17
 216.58.192.0/19
 216.239.32.0/19
@@ -204,6 +236,7 @@ start() {
     
     # 启动 redsocks
     pkill redsocks 2>/dev/null
+    sleep 1
     redsocks -c /etc/redsocks.conf
     
     # 创建新的 iptables 链
@@ -211,7 +244,7 @@ start() {
     
     # 添加 Google IP 规则
     for ip in $GOOGLE_IPS; do
-        iptables -t nat -A WARP_GOOGLE -d $ip -p tcp -j REDIRECT --to-ports 12345
+        iptables -t nat -A WARP_GOOGLE -d "$ip" -p tcp -j REDIRECT --to-ports 12345
     done
     
     # 应用到 OUTPUT 链
@@ -282,10 +315,10 @@ test_connection() {
     
     sleep 2
     
-    # 测试 Google
+    # 测试 Google (接受 200/301/302 均视为成功)
     GOOGLE_TEST=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" https://www.google.com)
-    if [ "$GOOGLE_TEST" = "200" ]; then
-        echo -e "${GREEN}✓ Google 连接成功！${NC}"
+    if [[ "$GOOGLE_TEST" =~ ^(200|301|302)$ ]]; then
+        echo -e "${GREEN}✓ Google 连接成功！状态码: $GOOGLE_TEST${NC}"
     else
         echo -e "${YELLOW}Google 测试返回: $GOOGLE_TEST${NC}"
     fi
@@ -295,7 +328,7 @@ test_connection() {
     if [ -n "$WARP_IP" ]; then
         WARP_INFO=$(curl -s --max-time 5 "http://ip-api.com/json/$WARP_IP?lang=zh-CN" 2>/dev/null)
         echo -e "\nWARP IP: ${GREEN}$WARP_IP${NC}"
-        echo -e "WARP 位置: ${GREEN}$(echo $WARP_INFO | grep -oP '"country":"\K[^"]+') - $(echo $WARP_INFO | grep -oP '"city":"\K[^"]+')${NC}"
+        echo -e "WARP 位置: ${GREEN}$(echo "$WARP_INFO" | grep -oP '"country":"\K[^"]+') - $(echo "$WARP_INFO" | grep -oP '"city":"\K[^"]+')${NC}"
     fi
 }
 
@@ -324,7 +357,12 @@ case "$1" in
         ;;
     test)
         echo "测试 Google 连接..."
-        curl -s --max-time 10 -o /dev/null -w "状态码: %{http_code}\n" https://www.google.com
+        CODE=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" https://www.google.com)
+        if [[ "$CODE" =~ ^(200|301|302)$ ]]; then
+            echo "✓ Google 连接成功！状态码: $CODE"
+        else
+            echo "✗ Google 连接异常，状态码: $CODE"
+        fi
         ;;
     ip)
         echo "直连 IP:"
@@ -333,6 +371,26 @@ case "$1" in
         echo "WARP IP:"
         curl -x socks5://127.0.0.1:40000 -s ip.sb
         echo ""
+        ;;
+    license)
+        if [ -z "$2" ]; then
+            echo "用法: warp license <密钥>"
+        else
+            echo "正在应用 License: $2"
+            warp-cli --accept-tos registration license "$2" 2>/dev/null || warp-cli registration license "$2" 2>/dev/null || warp-cli --accept-tos account license "$2" 2>/dev/null || warp-cli account license "$2" 2>/dev/null
+            sleep 2
+            warp-cli account 2>/dev/null | grep -i "Account type:" || warp-cli settings 2>/dev/null | grep -i "Account type:" || echo "WARP+ 升级命令已执行，请使用 warp status 查看详细状态。"
+        fi
+        ;;
+    team)
+        if [ -z "$2" ]; then
+            echo "用法: warp team <Token>"
+        else
+            echo "正在应用 Teams Token..."
+            warp-cli --accept-tos registration token "$2" 2>/dev/null || warp-cli registration token "$2" 2>/dev/null || warp-cli --accept-tos teams-enroll-token "$2" 2>/dev/null || warp-cli teams-enroll-token "$2" 2>/dev/null || warp-cli --accept-tos teams-enroll "$2" 2>/dev/null || warp-cli teams-enroll "$2" 2>/dev/null
+            sleep 2
+            warp-cli account 2>/dev/null | grep -i "Account type:" || warp-cli settings 2>/dev/null | grep -i "Account type:" || echo "WARP Teams 升级命令已执行，请使用 warp status 查看详细状态。"
+        fi
         ;;
     uninstall)
         echo "正在卸载..."
@@ -358,6 +416,8 @@ case "$1" in
         echo "  restart   重启 WARP"
         echo "  test      测试 Google"
         echo "  ip        查看 IP"
+        echo "  license   升级 WARP+ (配合额外参数: 密钥)"
+        echo "  team      升级 WARP Teams (配合额外参数: Token)"
         echo "  uninstall 卸载 WARP"
         ;;
 esac
@@ -378,7 +438,7 @@ do_install() {
     echo -e "${GREEN}╚════════════════════════════════════════════════════╝${NC}"
     echo -e "\n${YELLOW}所有 Google 流量现已自动通过 WARP！${NC}"
     echo -e "${YELLOW}无需任何额外配置，直接访问即可。${NC}"
-    echo -e "\n管理命令: ${CYAN}warp {status|start|stop|restart|test|ip|uninstall}${NC}\n"
+    echo -e "\n管理命令: ${CYAN}warp {status|start|stop|restart|test|ip|license|team|uninstall}${NC}\n"
 }
 
 # 卸载
@@ -400,6 +460,11 @@ do_uninstall() {
     
     # 删除 IPv6 黑洞路由
     ip -6 route del blackhole 2607:f8b0::/32 2>/dev/null
+    
+    # 清理 gai.conf 中添加的 IPv4 优先配置
+    if [ -f /etc/gai.conf ]; then
+        sed -i '/^precedence ::ffff:0:0\/96  100$/d' /etc/gai.conf
+    fi
     
     # 卸载软件包
     case $OS in
@@ -455,14 +520,14 @@ do_show_ip() {
     DIRECT_IP=$(curl -4 -s --max-time 5 ip.sb)
     DIRECT_INFO=$(curl -s --max-time 5 "http://ip-api.com/json/$DIRECT_IP?lang=zh-CN" 2>/dev/null)
     echo -e "IP: ${GREEN}$DIRECT_IP${NC}"
-    echo -e "位置: $(echo $DIRECT_INFO | grep -oP '"country":"\K[^"]+') - $(echo $DIRECT_INFO | grep -oP '"city":"\K[^"]+')\n"
+    echo -e "位置: $(echo "$DIRECT_INFO" | grep -oP '"country":"\K[^"]+') - $(echo "$DIRECT_INFO" | grep -oP '"city":"\K[^"]+')\n"
     
     echo -e "${YELLOW}【WARP IP】${NC}"
     WARP_IP=$(curl -x socks5://127.0.0.1:40000 -s --max-time 5 ip.sb 2>/dev/null)
     if [ -n "$WARP_IP" ]; then
         WARP_INFO=$(curl -s --max-time 5 "http://ip-api.com/json/$WARP_IP?lang=zh-CN" 2>/dev/null)
         echo -e "IP: ${GREEN}$WARP_IP${NC}"
-        echo -e "位置: $(echo $WARP_INFO | grep -oP '"country":"\K[^"]+') - $(echo $WARP_INFO | grep -oP '"city":"\K[^"]+')\n"
+        echo -e "位置: $(echo "$WARP_INFO" | grep -oP '"country":"\K[^"]+') - $(echo "$WARP_INFO" | grep -oP '"city":"\K[^"]+')\n"
     else
         echo -e "${RED}无法获取 (WARP 可能未运行)${NC}\n"
     fi
@@ -474,7 +539,7 @@ do_show_ip() {
 do_test_google() {
     echo -e "\n${CYAN}测试 Google 连接...${NC}"
     RESULT=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" https://www.google.com)
-    if [ "$RESULT" = "200" ]; then
+    if [[ "$RESULT" =~ ^(200|301|302)$ ]]; then
         echo -e "${GREEN}✓ Google 连接成功！状态码: $RESULT${NC}\n"
     else
         echo -e "${RED}✗ Google 连接失败，状态码: $RESULT${NC}\n"
@@ -497,20 +562,88 @@ do_stop() {
     echo -e "${GREEN}✓ WARP 已停止${NC}\n"
 }
 
+# 升级 WARP+
+do_upgrade_warp_plus() {
+    if ! command -v warp-cli &>/dev/null; then
+        echo -e "\n${RED}未安装 WARP 客户端，请先选择 1 进行安装！${NC}\n"
+        return
+    fi
+    echo -e "\n${CYAN}════════════ 升级 WARP+ ════════════${NC}\n"
+    echo -e "${YELLOW}请准备好你的 WARP+ License 密钥。${NC}"
+    read -p "请输入 License: " license_key
+    
+    if [ -z "$license_key" ]; then
+        echo -e "${RED}密钥不能为空！${NC}\n"
+        return
+    fi
+    
+    echo -e "\n${CYAN}正在应用 License: $license_key ...${NC}"
+    warp-cli --accept-tos registration license "$license_key" 2>/dev/null || \
+    warp-cli registration license "$license_key" 2>/dev/null || \
+    warp-cli --accept-tos account license "$license_key" 2>/dev/null || \
+    warp-cli account license "$license_key" 2>/dev/null
+    
+    sleep 2
+    # 查看当前账户类型状态
+    ACCOUNT_TYPE=$(warp-cli --accept-tos account 2>/dev/null | grep -i "Account type:" || warp-cli account 2>/dev/null | grep -i "Account type:" || warp-cli settings 2>/dev/null | grep -i "Account type:")
+    if [ -n "$ACCOUNT_TYPE" ]; then
+        echo -e "${GREEN}更新后账户状态: ${ACCOUNT_TYPE}${NC}\n"
+    else
+        echo -e "${GREEN}命令已执行，请使用 warp status 确认状态。${NC}\n"
+    fi
+}
+
+# 升级 WARP Teams
+do_upgrade_warp_teams() {
+    if ! command -v warp-cli &>/dev/null; then
+        echo -e "\n${RED}未安装 WARP 客户端，请先选择 1 进行安装！${NC}\n"
+        return
+    fi
+    echo -e "\n${CYAN}══════════ 升级 WARP Teams ══════════${NC}\n"
+    echo -e "${YELLOW}请准备好你的 WARP Teams (Zero Trust) Enrollment Token。${NC}"
+    read -p "请输入 Teams Token: " teams_token
+    
+    if [ -z "$teams_token" ]; then
+        echo -e "${RED}Token不能为空！${NC}\n"
+        return
+    fi
+    
+    echo -e "\n${CYAN}正在应用 Teams Token ...${NC}"
+    warp-cli --accept-tos registration token "$teams_token" 2>/dev/null || \
+    warp-cli registration token "$teams_token" 2>/dev/null || \
+    warp-cli --accept-tos teams-enroll-token "$teams_token" 2>/dev/null || \
+    warp-cli teams-enroll-token "$teams_token" 2>/dev/null || \
+    warp-cli --accept-tos teams-enroll "$teams_token" 2>/dev/null || \
+    warp-cli teams-enroll "$teams_token" 2>/dev/null
+    
+    sleep 2
+    # 查看当前账户类型状态
+    ACCOUNT_TYPE=$(warp-cli --accept-tos account 2>/dev/null | grep -i "Account type:" || warp-cli account 2>/dev/null | grep -i "Account type:" || warp-cli settings 2>/dev/null | grep -i "Account type:")
+    if [ -n "$ACCOUNT_TYPE" ]; then
+        echo -e "${GREEN}更新后账户状态: ${ACCOUNT_TYPE}${NC}\n"
+    else
+        echo -e "${GREEN}命令已执行，请使用 warp status 确认状态。${NC}\n"
+    fi
+}
+
 # 显示菜单
 show_menu() {
     echo -e "${YELLOW}请选择操作:${NC}\n"
-    echo -e "  ${GREEN}1.${NC} 安装 WARP (解锁 Gemini和商店等)"
-    echo -e "  ${GREEN}2.${NC} 卸载 WARP"
-    echo -e "  ${GREEN}3.${NC} 查看状态"
+    echo -e "  ${GREEN}1.${NC} 安装 WARP (默认免费版，解锁 Gemini和商店等)"
+    echo -e "  ${GREEN}2.${NC} 升级 WARP+ 账户 (输入 License 密钥)"
+    echo -e "  ${GREEN}3.${NC} 升级 WARP Teams (Zero Trust) 账户 (输入 Token)"
+    echo -e "  ${GREEN}4.${NC} 卸载 WARP"
+    echo -e "  ${GREEN}5.${NC} 查看状态与 IP"
     echo -e "  ${GREEN}0.${NC} 退出\n"
     
-    read -p "请输入选项 [0-3]: " choice
+    read -p "请输入选项 [0-5]: " choice
     
     case $choice in
         1) do_install ;;
-        2) do_uninstall ;;
-        3) do_status; do_show_ip; do_test_google ;;
+        2) do_upgrade_warp_plus ;;
+        3) do_upgrade_warp_teams ;;
+        4) do_uninstall ;;
+        5) do_status; do_show_ip; do_test_google ;;
         0) echo -e "\n${GREEN}再见！${NC}\n"; exit 0 ;;
         *) echo -e "\n${RED}无效选项${NC}\n" ;;
     esac
