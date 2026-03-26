@@ -1,20 +1,3 @@
-# 🚀 WARP Google/Gemini 专线解锁脚本 (系统级分流)
-
-**专为 VPS 解锁 Google Gemini、ChatGPT、Netflix 等流媒体设计。**
-**特别优化 RackNerd 等纯 IPv4 / 无 TUN 基础环境，一键修复“送中”问题。**
-
-![Bash](https://img.shields.io/badge/Language-Bash-green.svg) ![System](https://img.shields.io/badge/System-Linux-blue.svg) ![Support](https://img.shields.io/badge/Support-RackNerd%2FIPv4-orange.svg)
-
-## 🌟 核心痛点与解决方案
-
-你是否遇到了以下问题：
-* VPS IP 被 Google 标记（送中），无法使用 **Gemini**、**Google Search** 需验证码。
-* VPS 是 **RackNerd** 或其他廉价商家，**没有 IPv6**，安装普通 WARP 脚本报错 `RTNETLINK answers: Permission denied`。
-* 使用 Xray/Sing-box/Hy2，**不想修改复杂的 JSON 配置文件**来做分流。
-* 想看 YouTube **没广告**（利用送中 IP 特性），但又想解锁 Gemini。
-
-👉 **这个脚本就是为你准备的。**
-
 ## ✨ 功能特点
 
 1.  **系统级路由接管 (Zero Config)**
